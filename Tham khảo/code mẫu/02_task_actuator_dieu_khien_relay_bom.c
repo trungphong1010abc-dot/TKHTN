@@ -31,8 +31,10 @@ static bool IsPumpCommandValid(PumpCmd_t pump_cmd)
 
 void Task_Actuator(void *argument)
 {
-    ActuatorCmd_t cmd;
-    ActuatorFeedback_t feedback;
+    (void)argument;
+
+    ActuatorCmd_t cmd = {0};
+    ActuatorFeedback_t feedback = {0};
 
     PumpGpio_Init();
     PumpGpio_Write(false);

@@ -13,9 +13,11 @@ static void Cloud_SendTelemetry(const TelemetryPacket_t *packet)
 
 void Task_Cloud(void *argument)
 {
-    ControlData_t controlData;
-    SensorData_t latestSensorData;
-    TelemetryPacket_t packet;
+    (void)argument;
+
+    ControlData_t controlData = {0};
+    SensorData_t latestSensorData = {0};
+    TelemetryPacket_t packet = {0};
 
     memset(&packet, 0, sizeof(packet));
     strcpy(packet.device_id, "ESP32_WATERING_01");

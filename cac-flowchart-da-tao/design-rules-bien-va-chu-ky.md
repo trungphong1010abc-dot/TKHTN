@@ -48,9 +48,9 @@ Biến này thay thế hay bổ sung cho biến nào:
 
 ---
 
-# 1. Layer 1 - Sensing Layer
+## 1. Layer 1 - Sensing Layer
 
-## 1.1. Biến DHT22 đã chốt
+### 1.1. Biến DHT22 đã chốt
 
 ```text
 T_air
@@ -63,7 +63,7 @@ H_prev
 DHTData
 ```
 
-## 1.2. Biến Soil sensor đã chốt
+### 1.2. Biến Soil sensor đã chốt
 
 ```text
 ADC_filtered
@@ -74,7 +74,7 @@ Error_Flag
 SoilData
 ```
 
-## 1.3. Biến SensorData_t đã chốt
+### 1.3. Biến SensorData_t đã chốt
 
 ```text
 SensorData_t
@@ -108,9 +108,9 @@ Soil% -> H_soil
 
 ---
 
-# 2. Layer 2 - Edge Processing & Control Layer
+## 2. Layer 2 - Edge Processing & Control Layer
 
-## 2.1. Biến Layer 2 đã chốt
+### 2.1. Biến Layer 2 đã chốt
 
 ```text
 SensorData_t
@@ -143,7 +143,7 @@ control_status
 timestamp
 ```
 
-## 2.2. Luật GDD/CGDD
+### 2.2. Luật GDD/CGDD
 
 ```text
 GDD/CGDD dùng để xác định current_stage.
@@ -151,13 +151,13 @@ Theo Tổng quan.pdf, GDD/CGDD cập nhật cuối ngày để xác định Stag
 Nếu vẫn dùng flow task control hiện tại, GDD_increment và CGDD vẫn được giữ theo ảnh flow đã vẽ.
 ```
 
-## 2.3. Luật điều khiển tưới chi tiết theo Stage
+### 2.3. Luật điều khiển tưới chi tiết theo Stage
 
 Layer 2 phải dùng `current_stage`, `H_soil`, `T_air`, `H_air` để chọn `soil_state`, `WATER_DURATION_MS`, `pump_cmd`.
 
 Không tự đổi tên `WATER_DURATION_MS` thành `pumpTime`, `base_pumpTime`, `final_pumpTime`.
 
-### Stage 1 - cây non
+#### Stage 1 - cây non
 
 ```text
 H_soil > 70%
@@ -189,7 +189,7 @@ H_air < 50% -> +5s nếu H_soil <= 25%
 H_air > 90% -> -2s
 ```
 
-### Stage 2 - cây phát triển mạnh
+#### Stage 2 - cây phát triển mạnh
 
 ```text
 H_soil > 75%
@@ -217,7 +217,7 @@ H_air < 45% -> +5s
 H_air > 90% -> -2s
 ```
 
-### Stage 3 - cây trưởng thành
+#### Stage 3 - cây trưởng thành
 
 ```text
 H_soil > 80%
@@ -245,7 +245,7 @@ H_air < 45% -> +3s
 H_air > 90% -> -2s
 ```
 
-## 2.4. Quy tắc tạo lệnh bơm
+### 2.4. Quy tắc tạo lệnh bơm
 
 ```text
 Nếu WATER_DURATION_MS > 0 và đã đủ MIN_WATER_INTERVAL:
@@ -257,7 +257,7 @@ pump_cmd = OFF
 control_status = SOIL_MOISTURE_OK hoặc SAFETY_LOCK hoặc SOIL_ERROR
 ```
 
-## 2.5. Ngưỡng thời gian nghỉ tưới đã chốt
+### 2.5. Ngưỡng thời gian nghỉ tưới đã chốt
 
 ```text
 MIN_WATER_INTERVAL = 30 phút
@@ -280,18 +280,18 @@ control_status = SAFETY_LOCK
 
 ---
 
-# 3. Layer 3 - Actuator Layer
+## 3. Layer 3 - Actuator Layer
 
 Theo ảnh `flow layer actuator.jpg` và `flow các layer.jpg`.
 
-## 3.1. Biến Layer 3 đã chốt
+### 3.1. Biến Layer 3 đã chốt
 
 ```text
 pump_cmd
 pump_state
 ```
 
-## 3.2. Thành phần phần cứng Layer 3
+### 3.2. Thành phần phần cứng Layer 3
 
 ```text
 GPIO ESP32
@@ -327,9 +327,9 @@ pumpTime
 
 ---
 
-# 4. Layer 4 - Task_Cloud / IoT Communication
+## 4. Layer 4 - Task_Cloud / IoT Communication
 
-## 4.1. Biến đầu vào của Task_Cloud
+### 4.1. Biến đầu vào của Task_Cloud
 
 ```text
 DHTData
@@ -338,7 +338,7 @@ SensorData_t
 ControlData_t
 ```
 
-## 4.2. Biến trong SensorData_t
+### 4.2. Biến trong SensorData_t
 
 ```text
 T_air
@@ -350,7 +350,7 @@ Error_Flag
 timestamp
 ```
 
-## 4.3. Biến trong ControlData_t
+### 4.3. Biến trong ControlData_t
 
 ```text
 H_soil
@@ -369,7 +369,7 @@ Ghi chú:
 Hai tên này đang lệch trong ảnh gốc, chưa tự ý thay nếu chưa hỏi lại.
 ```
 
-## 4.4. Biến Task_Cloud / IoT
+### 4.4. Biến Task_Cloud / IoT
 
 ```text
 TelemetryPacket_t
@@ -389,7 +389,7 @@ cloud_ready
 
 ---
 
-# 5. Chu kỳ đã chốt
+## 5. Chu kỳ đã chốt
 
 ```text
 Chu kỳ đo cảm biến / Task_Cloud: 60s
@@ -404,7 +404,7 @@ GDD/CGDD cập nhật cuối ngày theo Tổng quan.pdf
 
 ---
 
-# 6. Nối biến giữa các layer đã chốt
+## 6. Nối biến giữa các layer đã chốt
 
 ```text
 Layer 1 -> Layer 2:

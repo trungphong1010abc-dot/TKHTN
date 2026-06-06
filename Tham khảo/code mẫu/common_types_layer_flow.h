@@ -3,8 +3,9 @@
 
 #include <stdint.h>
 #include <stdbool.h>
-#include "FreeRTOS.h"
-#include "queue.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/queue.h"
+#include "freertos/task.h"
 
 typedef enum {
     PUMP_CMD_OFF = 0,
@@ -71,5 +72,10 @@ typedef struct {
 extern QueueHandle_t actuatorCmdQueue;
 extern QueueHandle_t actuatorFeedbackQueue;
 extern QueueHandle_t controlToCloudQueue;
+
+void LayerFlow_CreateQueues(void);
+void Task_Control(void *argument);
+void Task_Actuator(void *argument);
+void Task_Cloud(void *argument);
 
 #endif

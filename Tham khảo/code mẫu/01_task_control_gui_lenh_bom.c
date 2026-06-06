@@ -18,24 +18,22 @@ static PumpCmd_t DecidePumpCommand(const SensorData_t *sensor)
 
 void Task_Control(void *argument)
 {
-    SensorData_t sensorData;
-    ActuatorCmd_t actuatorCmd;
-    ActuatorFeedback_t feedback;
-    ControlData_t controlData;
+    (void)argument;
+
+    SensorData_t sensorData = {0};
+    ActuatorCmd_t actuatorCmd = {0};
+    ActuatorFeedback_t feedback = {0};
+    ControlData_t controlData = {0};
 
     for (;;) {
-        /*
-         * Code thật: nhận sensorData từ sensorToControlQueue.
-         * Ở file mẫu này, sensorData được giả định đã có dữ liệu mới.
-         */
+        if (xQueueReceive(sensorToControlQueue, &sensorData, pdMS_TO_TICKS(1000)) == pdPASS) {
+            actuatorCmd.pump_cmd = DecidePumpCommand(&sensorData);
+            actuatorCmd.watering_duration_ms = WATERING_DURATION_MS;
+            actuatorCmd.timestamp = xTaskGetTickCount();
 
-        actuatorCmd.pump_cmd = DecidePumpCommand(&sensorData);
-        actuatorCmd.watering_duration_ms = WATERING_DURATION_MS;
-        actuatorCmd.timestamp = xTaskGetTickCount();
+            xQueueSend(actuatorCmdQueue, &actuatorCmd, 0);
 
-        xQueueSend(actuatorCmdQueue, &actuatorCmd, 0);
-
-        if (xQueueReceive(actuatorFeedbackQueue, &feedback, pdMS_TO_TICKS(1000)) == pdPASS) {
+            if (xQueueReceive(actuatorFeedbackQueue, &feedback, pdMS_TO_TICKS(1000)) == pdPASS) {
             controlData.pump_cmd = actuatorCmd.pump_cmd;
             controlData.pump_state = feedback.pump_state;
             controlData.relay_state = feedback.relay_state;

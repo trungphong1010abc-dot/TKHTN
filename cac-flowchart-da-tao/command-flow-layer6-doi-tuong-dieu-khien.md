@@ -21,7 +21,7 @@ timestamp
 
 ---
 
-# Layer 6 - Đối tượng điều khiển
+## Layer 6 - Đối tượng điều khiển
 
 ```text
 [Layer 6. Đối tượng điều khiển]
@@ -95,7 +95,7 @@ Giải thích: Ở chu kỳ tiếp theo, Layer 1 đọc Soil Sensor để lấy 
 
 ---
 
-# Mũi tên nối Layer 6
+## Mũi tên nối Layer 6
 
 ```text
 Layer 3 [L3-5. Cập nhật trạng thái bơm]
