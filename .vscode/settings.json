@@ -1,5 +1,9 @@
 {
+  "markdown.validate.enabled": false,
   "markdownlint.config": {
-    "MD025": false
+    "default": false
+  },
+  "cSpell.enabledFileTypes": {
+    "markdown": false
   }
 }

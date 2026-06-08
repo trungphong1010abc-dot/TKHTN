@@ -1,389 +1,361 @@
 #include <Arduino.h>
-#include <Preferences.h>
-#include <WiFi.h>
-#include <time.h>
+#include <esp_task_wdt.h>
+
+#include "actuator.h"
+#include "cloud.h"
 #include "config.h"
-#include "gdd_manager.h"
-#include "pump_controller.h"
-#include "sensor_manager.h"
-#include "thingsboard_manager.h"
+#include "control.h"
+#include "sensing.h"
+#include "types.h"
 
-static SensorData latestSensorData{};
-static WateringDecision latestWateringDecision{
-  0,
-  "Unknown",
-  false,
-  false
-};
-static Preferences preferences;
+namespace {
+QueueHandle_t sensorToControlQueue = nullptr;
+QueueHandle_t actuatorCmdQueue = nullptr;
+QueueHandle_t actuatorFeedbackQueue = nullptr;
+QueueHandle_t controlToCloudQueue = nullptr;
+QueueHandle_t cloudTelemetryQueue = nullptr;
+SemaphoreHandle_t latestSensorMutex = nullptr;
+SemaphoreHandle_t latestPumpStateMutex = nullptr;
 
-static float completedCgdd = 0.0f;
-static float currentDailyGdd = 0.0f;
-static float dayTmax = NAN;
-static float dayTmin = NAN;
-static bool hasDayTemperatureSample = false;
-static int currentStage = 1;
-static int activeDayKey = 0;
-static bool timeConfigured = false;
-static bool timeSynchronized = false;
+SensorData_t latestSensorData;
+PumpState_t latestPumpStateData;
 
-static unsigned long lastSensorReadMs = 0;
-static unsigned long lastTelemetryMs = 0;
-static unsigned long lastSerialPrintMs = 0;
-static unsigned long lastTimeSyncCheckMs = 0;
-static unsigned long lastDailyStateSaveMs = 0;
-
-static int makeDayKey(const tm& timeInfo) {
-  return ((timeInfo.tm_year + 1900) * 10000) +
-         ((timeInfo.tm_mon + 1) * 100) +
-         timeInfo.tm_mday;
+void watchdog_reset_routine() {
+  esp_task_wdt_reset();
 }
 
-static bool readLocalTime(tm& timeInfo) {
-  return getLocalTime(&timeInfo, 50);
+void watchdogRegisterCurrentTask() {
+  esp_task_wdt_add(nullptr);
+  watchdog_reset_routine();
 }
 
-static void configureTimeIfNeeded() {
-  if (timeConfigured || WiFi.status() != WL_CONNECTED) {
-    return;
-  }
-
-  configTime(GMT_OFFSET_SEC,
-             DAYLIGHT_OFFSET_SEC,
-             NTP_SERVER_PRIMARY,
-             NTP_SERVER_SECONDARY,
-             NTP_SERVER_TERTIARY);
-  timeConfigured = true;
-  Serial.println(F("[TIME] NTP configured for UTC+7"));
-}
-
-static void maintainTimeSync(unsigned long nowMs) {
-  if (nowMs - lastTimeSyncCheckMs < TIME_SYNC_CHECK_INTERVAL_MS) {
-    return;
-  }
-
-  lastTimeSyncCheckMs = nowMs;
-  configureTimeIfNeeded();
-
-  tm timeInfo{};
-  if (!readLocalTime(timeInfo)) {
-    timeSynchronized = false;
-    Serial.println(F("[TIME] Waiting for NTP time"));
-    return;
-  }
-
-  if (!timeSynchronized) {
-    timeSynchronized = true;
-    Serial.print(F("[TIME] Synced. Local date key = "));
-    Serial.println(makeDayKey(timeInfo));
+void watchdogDelay(uint32_t delay_ms) {
+  uint32_t elapsed = 0;
+  while (elapsed < delay_ms) {
+    const uint32_t chunk = min<uint32_t>(1000UL, delay_ms - elapsed);
+    vTaskDelay(pdMS_TO_TICKS(chunk));
+    elapsed += chunk;
+    watchdog_reset_routine();
   }
 }
 
-static void saveDailyState(bool force) {
-  const unsigned long nowMs = millis();
-  if (!force && nowMs - lastDailyStateSaveMs < DAILY_STATE_SAVE_INTERVAL_MS) {
+void updateLatestSensorData(const SensorData_t &SensorData) {
+  if (latestSensorMutex == nullptr) {
     return;
   }
 
-  preferences.putInt("dayKey", activeDayKey);
-  preferences.putBool("hasTemp", hasDayTemperatureSample);
-  preferences.putFloat("tmax", dayTmax);
-  preferences.putFloat("tmin", dayTmin);
-  lastDailyStateSaveMs = nowMs;
-}
-
-static void resetDailyTemperatureState(int newDayKey) {
-  activeDayKey = newDayKey;
-  dayTmax = NAN;
-  dayTmin = NAN;
-  currentDailyGdd = 0.0f;
-  hasDayTemperatureSample = false;
-  saveDailyState(true);
-}
-
-static void loadGddState() {
-  completedCgdd = preferences.getFloat("cgdd", 0.0f);
-  activeDayKey = preferences.getInt("dayKey", 0);
-  hasDayTemperatureSample = preferences.getBool("hasTemp", false);
-  dayTmax = preferences.getFloat("tmax", NAN);
-  dayTmin = preferences.getFloat("tmin", NAN);
-
-  if (!hasDayTemperatureSample || isnan(dayTmax) || isnan(dayTmin)) {
-    dayTmax = NAN;
-    dayTmin = NAN;
-    currentDailyGdd = 0.0f;
-    hasDayTemperatureSample = false;
-  } else {
-    currentDailyGdd = calculateGDD(dayTmax, dayTmin);
-  }
-
-  currentStage = determineStage(completedCgdd);
-}
-
-static void onModeCommand(SystemMode mode) {
-  setCurrentMode(mode);
-  Serial.print(F("[RPC] Mode changed to "));
-  Serial.println(modeToString(mode));
-}
-
-static void onPumpCommand(bool turnOn) {
-  if (getCurrentMode() != MANUAL_MODE) {
-    Serial.println(F("[RPC] setPump ignored because current mode is AUTO"));
-    return;
-  }
-
-  if (turnOn) {
-    startPump();
-  } else {
-    stopPump();
+  if (xSemaphoreTake(latestSensorMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+    if (SensorData.timestamp >= latestSensorData.timestamp) {
+      latestSensorData = SensorData;
+    }
+    xSemaphoreGive(latestSensorMutex);
   }
 }
 
-static void updateDailyTemperatureRange(float temperature) {
-  if (isnan(dayTmax) || temperature > dayTmax) {
-    dayTmax = temperature;
+SensorData_t getLatestSensorData() {
+  SensorData_t snapshot;
+  if (latestSensorMutex != nullptr && xSemaphoreTake(latestSensorMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+    snapshot = latestSensorData;
+    xSemaphoreGive(latestSensorMutex);
   }
-
-  if (isnan(dayTmin) || temperature < dayTmin) {
-    dayTmin = temperature;
-  }
-
-  hasDayTemperatureSample = true;
-  currentDailyGdd = calculateGDD(dayTmax, dayTmin);
-  saveDailyState(false);
+  return snapshot;
 }
 
-static void closeDayIfDateChanged() {
-  tm timeInfo{};
-  if (!readLocalTime(timeInfo)) {
+void updateLatestPumpState(const PumpState_t &PumpStateData) {
+  if (latestPumpStateMutex == nullptr) {
     return;
   }
 
-  const int currentDayKey = makeDayKey(timeInfo);
-  if (activeDayKey == 0) {
-    resetDailyTemperatureState(currentDayKey);
-    return;
+  if (xSemaphoreTake(latestPumpStateMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+    if (PumpStateData.timestamp >= latestPumpStateData.timestamp) {
+      latestPumpStateData = PumpStateData;
+    }
+    xSemaphoreGive(latestPumpStateMutex);
   }
-
-  if (currentDayKey == activeDayKey) {
-    return;
-  }
-
-  if (!hasDayTemperatureSample) {
-    resetDailyTemperatureState(currentDayKey);
-    return;
-  }
-
-  const float finalDailyGdd = calculateGDD(dayTmax, dayTmin);
-  completedCgdd += finalDailyGdd;
-  preferences.putFloat("cgdd", completedCgdd);
-
-  currentStage = determineStage(completedCgdd);
-
-  Serial.print(F("[GDD] End of day. Daily GDD = "));
-  Serial.print(finalDailyGdd, 2);
-  Serial.print(F(", CGDD = "));
-  Serial.println(completedCgdd, 2);
-
-  resetDailyTemperatureState(currentDayKey);
 }
 
-static void printWateringDecision(const char* prefix,
-                                  const WateringDecision& decision) {
-  Serial.print(prefix);
-  Serial.print(F(" Stage="));
-  Serial.print(currentStage);
-  Serial.print(F(", Soil="));
-  Serial.print(latestSensorData.soilPercent, 1);
-  Serial.print(F("%, SoilStatus="));
-  Serial.print(decision.soilStatus);
-  Serial.print(F(", Temp="));
-  Serial.print(latestSensorData.temperature, 1);
-  Serial.print(F("C, RH="));
-  Serial.print(latestSensorData.humidity, 1);
-  Serial.print(F("%, FloodWarning="));
-  Serial.print(decision.floodWarning ? F("YES") : F("NO"));
-  Serial.print(F(", PumpTime="));
-  Serial.print(decision.pumpTimeSec);
-  Serial.println(F("s"));
+PumpState_t getLatestPumpState() {
+  PumpState_t snapshot;
+  if (latestPumpStateMutex != nullptr && xSemaphoreTake(latestPumpStateMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+    snapshot = latestPumpStateData;
+    xSemaphoreGive(latestPumpStateMutex);
+  }
+  return snapshot;
 }
 
-static void handleAutomaticWatering() {
-  if (getCurrentMode() != AUTO_MODE) {
-    printWateringDecision("[AUTO] Manual mode", latestWateringDecision);
-    return;
-  }
-
-  if (isPumpRunning()) {
-    printWateringDecision("[AUTO] Pump running", latestWateringDecision);
-    return;
-  }
-
-  if (latestSensorData.errorFlag) {
-    latestWateringDecision = {
-      0,
-      latestSensorData.soilValid ? "Unknown" : "Sensor Error",
-      false,
-      false
-    };
-    printWateringDecision("[AUTO] Sensor error", latestWateringDecision);
-    return;
-  }
-
-  latestWateringDecision = calculateWateringDecision(latestSensorData.soilPercent,
-                                                     latestSensorData.temperature,
-                                                     latestSensorData.humidity,
-                                                     currentStage);
-  printWateringDecision("[AUTO]", latestWateringDecision);
-
-  if (!latestWateringDecision.shouldWater) {
-    return;
-  }
-
-  if (!pumpCanStart(AUTO_WATER_COOLDOWN_MS)) {
-    printWateringDecision("[AUTO] Cooldown active", latestWateringDecision);
-    return;
-  }
-
-  Serial.print(F("[AUTO] Starting pump for "));
-  Serial.print(latestWateringDecision.pumpTimeSec);
-  Serial.println(F(" seconds"));
-  startPump(static_cast<unsigned long>(latestWateringDecision.pumpTimeSec));
+void printSensorData(const char *tag, const SensorData_t &SensorData) {
+  Serial.print(tag);
+  Serial.print(" DHT=");
+  Serial.print(statusToText(SensorData.dhtData.DHT_status));
+  Serial.print(" T_air=");
+  Serial.print(SensorData.dhtData.T_air);
+  Serial.print(" H_air=");
+  Serial.print(SensorData.dhtData.H_air);
+  Serial.print(" Soil=");
+  Serial.print(statusToText(SensorData.soilData.Soil_status));
+  Serial.print(" ADC=");
+  Serial.print(SensorData.soilData.ADC_filtered);
+  Serial.print(" H_soil=");
+  Serial.print(SensorData.soilData.H_soil);
+  Serial.print(" error=");
+  Serial.println(SensorData.Error_Flag ? "YES" : "NO");
 }
 
-static void printStatus() {
-  Serial.println(F("========== SYSTEM STATUS =========="));
-  Serial.print(F("Temperature: "));
-  Serial.print(latestSensorData.temperature, 1);
-  Serial.println(F(" C"));
+void printTelemetryData(const TelemetryPacket_t &TelemetryPacket) {
+  const SensorData_t &SensorData = TelemetryPacket.SensorData;
+  const ControlData_t &ControlData = TelemetryPacket.ControlData;
+  const PumpState_t &PumpStateData = TelemetryPacket.PumpStateData;
 
-  Serial.print(F("Humidity: "));
-  Serial.print(latestSensorData.humidity, 1);
-  Serial.println(F(" %RH"));
-
-  Serial.print(F("Soil ADC: "));
-  Serial.println(latestSensorData.soilAdcRaw);
-
-  Serial.print(F("Soil ADC filtered: "));
-  Serial.println(latestSensorData.soilAdcFiltered);
-
-  Serial.print(F("SoilPercent: "));
-  Serial.print(latestSensorData.soilPercent, 1);
-  Serial.println(F(" %"));
-
-  Serial.print(F("DHT22_status: "));
-  Serial.println(sensorStatusText(latestSensorData.dhtValid));
-
-  Serial.print(F("Soil_status: "));
-  Serial.println(sensorStatusText(latestSensorData.soilValid));
-
-  Serial.print(F("SoilStatus: "));
-  Serial.println(latestWateringDecision.soilStatus);
-
-  Serial.print(F("FloodWarning: "));
-  Serial.println(latestWateringDecision.floodWarning ? F("YES") : F("NO"));
-
-  Serial.print(F("PumpTimeSec: "));
-  Serial.println(latestWateringDecision.pumpTimeSec);
-
-  Serial.print(F("GDD today estimate: "));
-  Serial.println(currentDailyGdd, 2);
-
-  Serial.print(F("CGDD completed: "));
-  Serial.println(completedCgdd, 2);
-
-  Serial.print(F("ActiveDayKey: "));
-  Serial.println(activeDayKey);
-
-  Serial.print(F("TimeSync: "));
-  Serial.println(timeSynchronized ? F("SYNCED") : F("WAITING"));
-
-  Serial.print(F("Stage: "));
-  Serial.print(currentStage);
-  Serial.print(F(" - "));
-  Serial.println(stageName(currentStage));
-
-  Serial.print(F("Mode: "));
-  Serial.println(modeToString(getCurrentMode()));
-
-  Serial.print(F("PumpState: "));
-  Serial.println(isPumpRunning() ? F("ON") : F("OFF"));
-
-  Serial.print(F("WiFi: "));
-  Serial.println(WiFi.status() == WL_CONNECTED ? F("CONNECTED") : F("DISCONNECTED"));
-
-  Serial.print(F("ThingsBoard: "));
-  Serial.println(thingsBoardConnected() ? F("CONNECTED") : F("DISCONNECTED"));
-  Serial.println(F("==================================="));
+  Serial.print("[Telemetry]");
+  Serial.print(" timestamp=");
+  Serial.print(TelemetryPacket.timestamp);
+  Serial.print(" wifi_status=");
+  Serial.print(TelemetryPacket.wifi_status ? "OK" : "OFF");
+  Serial.print(" cloud_status=");
+  Serial.print(TelemetryPacket.cloud_status ? "OK" : "OFF");
+  Serial.print(" T_air=");
+  Serial.print(SensorData.dhtData.T_air);
+  Serial.print(" H_air=");
+  Serial.print(SensorData.dhtData.H_air);
+  Serial.print(" DHT_status=");
+  Serial.print(statusToText(SensorData.dhtData.DHT_status));
+  Serial.print(" DHT_Error_Flag=");
+  Serial.print(SensorData.dhtData.DHT_Error_Flag ? "true" : "false");
+  Serial.print(" ADC_filtered=");
+  Serial.print(SensorData.soilData.ADC_filtered);
+  Serial.print(" H_soil=");
+  Serial.print(SensorData.soilData.H_soil);
+  Serial.print(" Soil_status=");
+  Serial.print(statusToText(SensorData.soilData.Soil_status));
+  Serial.print(" Soil_Error_Flag=");
+  Serial.print(SensorData.soilData.Soil_Error_Flag ? "true" : "false");
+  Serial.print(" Error_Flag=");
+  Serial.print(SensorData.Error_Flag ? "true" : "false");
+  Serial.print(" GDD=");
+  Serial.print(ControlData.GDD);
+  Serial.print(" CGDD=");
+  Serial.print(ControlData.CGDD);
+  Serial.print(" current_stage=");
+  Serial.print(ControlData.current_stage);
+  Serial.print(" soil_state=");
+  Serial.print(ControlData.soil_state);
+  Serial.print(" H_threshold=");
+  Serial.print(ControlData.H_threshold);
+  Serial.print(" WATER_DURATION_MS=");
+  Serial.print(ControlData.WATER_DURATION_MS);
+  Serial.print(" watering_duration=");
+  Serial.print(ControlData.watering_duration);
+  Serial.print(" WATER_DURATION_SEC=");
+  Serial.print(ControlData.WATER_DURATION_MS / 1000.0f);
+  Serial.print(" watering_duration_sec=");
+  Serial.print(ControlData.watering_duration / 1000.0f);
+  Serial.print(" pump_cmd=");
+  Serial.print(pumpStateToText(ControlData.pump_cmd));
+  Serial.print(" pump_state=");
+  Serial.print(pumpStateToText(PumpStateData.pump_state));
+  Serial.print(" control_status=");
+  Serial.println(controlStatusToText(ControlData.control_status));
 }
+
+void sendSensorToControlAndCloud(const SensorData_t &SensorData) {
+  xQueueSend(sensorToControlQueue, &SensorData, pdMS_TO_TICKS(100));
+  xQueueSend(cloudTelemetryQueue, &SensorData, pdMS_TO_TICKS(100));
+  updateLatestSensorData(SensorData);
+}
+
+void sendPumpCmd(PumpState pump_cmd) {
+  PumpCmd_t command;
+  command.pump_cmd = pump_cmd;
+  command.timestamp = millis();
+  xQueueSend(actuatorCmdQueue, &command, pdMS_TO_TICKS(100));
+}
+
+void Task_Sensor(void *parameter) {
+  (void)parameter;
+  watchdogRegisterCurrentTask();
+
+  for (;;) {
+    watchdog_reset_routine();
+    const SensorData_t SensorData = readSensorData();
+    printSensorData("[Sensor]", SensorData);
+    sendSensorToControlAndCloud(SensorData);
+    watchdog_reset_routine();
+    watchdogDelay(SENSOR_PERIOD_MS);
+  }
+}
+
+void Task_Control(void *parameter) {
+  (void)parameter;
+  watchdogRegisterCurrentTask();
+  SensorData_t SensorData;
+
+  for (;;) {
+    watchdog_reset_routine();
+    if (xQueueReceive(sensorToControlQueue, &SensorData, pdMS_TO_TICKS(1000)) != pdTRUE) {
+      continue;
+    }
+    watchdog_reset_routine();
+
+    ControlData_t ControlData = processControlData(SensorData);
+
+    if (ControlData.pump_cmd == PumpState::ON && ControlData.WATER_DURATION_MS > 0) {
+      sendPumpCmd(PumpState::ON);
+      xQueueSend(controlToCloudQueue, &ControlData, pdMS_TO_TICKS(100));
+
+      watchdogDelay(ControlData.WATER_DURATION_MS);
+      watchdog_reset_routine();
+
+      sendPumpCmd(PumpState::OFF);
+      ControlData.pump_cmd = PumpState::OFF;
+      ControlData.control_status = ControlStatus::WATERING_DONE;
+      ControlData.timestamp = millis();
+      xQueueSend(controlToCloudQueue, &ControlData, pdMS_TO_TICKS(100));
+    } else {
+      sendPumpCmd(PumpState::OFF);
+      xQueueSend(controlToCloudQueue, &ControlData, pdMS_TO_TICKS(100));
+    }
+  }
+}
+
+void Task_Actuator(void *parameter) {
+  (void)parameter;
+  watchdogRegisterCurrentTask();
+  PumpCmd_t command;
+
+  for (;;) {
+    watchdog_reset_routine();
+    if (xQueueReceive(actuatorCmdQueue, &command, pdMS_TO_TICKS(1000)) != pdTRUE) {
+      continue;
+    }
+    watchdog_reset_routine();
+
+    const PumpState_t pump_state = applyPumpCmd(command);
+    updateLatestPumpState(pump_state);
+    xQueueSend(actuatorFeedbackQueue, &pump_state, pdMS_TO_TICKS(100));
+  }
+}
+
+void Task_Feedback(void *parameter) {
+  (void)parameter;
+  watchdogRegisterCurrentTask();
+  PumpState_t pump_state;
+
+  for (;;) {
+    watchdog_reset_routine();
+    if (xQueueReceive(actuatorFeedbackQueue, &pump_state, pdMS_TO_TICKS(1000)) != pdTRUE) {
+      continue;
+    }
+    watchdog_reset_routine();
+
+    if (pump_state.pump_state == PumpState::ON) {
+      continue;
+    }
+
+    watchdogDelay(SOIL_SETTLE_DELAY_MS);
+    watchdog_reset_routine();
+
+    const SensorData_t feedbackSensorData = readFeedbackSensorData(getLatestSensorData());
+    printSensorData("[Feedback]", feedbackSensorData);
+    sendSensorToControlAndCloud(feedbackSensorData);
+  }
+}
+
+void Task_Cloud(void *parameter) {
+  (void)parameter;
+  watchdogRegisterCurrentTask();
+  SensorData_t SensorData;
+  ControlData_t ControlData;
+  TickType_t lastTelemetryTime = 0;
+  TickType_t lastWaitingLogTime = 0;
+
+  for (;;) {
+    watchdog_reset_routine();
+    cloudLoop();
+
+    SensorData_t queuedSensorData;
+    while (xQueueReceive(cloudTelemetryQueue, &queuedSensorData, 0) == pdTRUE) {
+      if (queuedSensorData.timestamp >= SensorData.timestamp) {
+        SensorData = queuedSensorData;
+      }
+    }
+
+    ControlData_t queuedControlData;
+    while (xQueueReceive(controlToCloudQueue, &queuedControlData, 0) == pdTRUE) {
+      if (queuedControlData.timestamp >= ControlData.timestamp) {
+        ControlData = queuedControlData;
+      }
+    }
+
+    if (SensorData.timestamp == 0) {
+      const TickType_t now = xTaskGetTickCount();
+      if (now - lastWaitingLogTime >= pdMS_TO_TICKS(1000)) {
+        Serial.println("[Cloud] waiting for sensor data");
+        lastWaitingLogTime = now;
+      }
+      vTaskDelay(pdMS_TO_TICKS(100));
+      continue;
+    }
+
+    const TickType_t now = xTaskGetTickCount();
+    if (lastTelemetryTime != 0 && now - lastTelemetryTime < pdMS_TO_TICKS(TELEMETRY_PERIOD_MS)) {
+      vTaskDelay(pdMS_TO_TICKS(100));
+      continue;
+    }
+
+    TelemetryPacket_t TelemetryPacket = makeTelemetryPacket(SensorData, ControlData, getLatestPumpState());
+    TelemetryPacket.cloud_status = publishTelemetryPacket(TelemetryPacket);
+    printTelemetryData(TelemetryPacket);
+    watchdog_reset_routine();
+    lastTelemetryTime = now;
+
+    vTaskDelay(pdMS_TO_TICKS(100));
+  }
+}
+
+void createQueues() {
+  sensorToControlQueue = xQueueCreate(8, sizeof(SensorData_t));
+  actuatorCmdQueue = xQueueCreate(8, sizeof(PumpCmd_t));
+  actuatorFeedbackQueue = xQueueCreate(8, sizeof(PumpState_t));
+  controlToCloudQueue = xQueueCreate(8, sizeof(ControlData_t));
+  cloudTelemetryQueue = xQueueCreate(8, sizeof(SensorData_t));
+  latestSensorMutex = xSemaphoreCreateMutex();
+  latestPumpStateMutex = xSemaphoreCreateMutex();
+
+  configASSERT(sensorToControlQueue != nullptr);
+  configASSERT(actuatorCmdQueue != nullptr);
+  configASSERT(actuatorFeedbackQueue != nullptr);
+  configASSERT(controlToCloudQueue != nullptr);
+  configASSERT(cloudTelemetryQueue != nullptr);
+  configASSERT(latestSensorMutex != nullptr);
+  configASSERT(latestPumpStateMutex != nullptr);
+}
+
+void createTasks() {
+  xTaskCreatePinnedToCore(Task_Actuator, "Task_Actuator", 4096, nullptr, PRIORITY_TASK_ACTUATOR, nullptr, 1);
+  xTaskCreatePinnedToCore(Task_Control, "Task_Control", 6144, nullptr, PRIORITY_TASK_CONTROL, nullptr, 1);
+  xTaskCreatePinnedToCore(Task_Sensor, "Task_Sensor", 4096, nullptr, PRIORITY_TASK_SENSOR, nullptr, 1);
+  xTaskCreatePinnedToCore(Task_Feedback, "Task_Feedback", 4096, nullptr, PRIORITY_TASK_FEEDBACK, nullptr, 1);
+  xTaskCreatePinnedToCore(Task_Cloud, "Task_Cloud", 8192, nullptr, PRIORITY_TASK_CLOUD, nullptr, 0);
+}
+}  // namespace
 
 void setup() {
   Serial.begin(115200);
-  delay(500);
+  delay(200);
 
-  Serial.println(F("\nESP32 GDD/CGDD Automatic Irrigation System"));
+  esp_task_wdt_init(WATCHDOG_TIMEOUT_SEC, true);
 
-  pumpBegin();
-  sensorBegin();
-  setCurrentMode(AUTO_MODE);
+  sensingBegin();
+  controlBegin();
+  actuatorBegin();
+  cloudBegin();
 
-  preferences.begin("gdd_state", false);
-  loadGddState();
+  createQueues();
+  createTasks();
 
-  Serial.print(F("[GDD] Loaded CGDD = "));
-  Serial.println(completedCgdd, 2);
-
-  thingsBoardBegin();
-  thingsBoardSetCommandCallbacks(onModeCommand, onPumpCommand);
-
-  const unsigned long nowMs = millis();
-  lastSensorReadMs = nowMs - SENSOR_READ_INTERVAL_MS;
-  lastTelemetryMs = nowMs - TELEMETRY_INTERVAL_MS;
-  lastSerialPrintMs = nowMs - SERIAL_PRINT_INTERVAL_MS;
-  lastTimeSyncCheckMs = nowMs - TIME_SYNC_CHECK_INTERVAL_MS;
-  lastDailyStateSaveMs = nowMs;
-
-  connectWiFi();
-  configureTimeIfNeeded();
+  Serial.println("ESP32 IoT irrigation system started");
 }
 
 void loop() {
-  const unsigned long nowMs = millis();
-
-  thingsBoardSetCurrentMode(getCurrentMode());
-  thingsBoardLoop();
-  maintainTimeSync(nowMs);
-  pumpUpdate();
-
-  if (nowMs - lastSensorReadMs >= SENSOR_READ_INTERVAL_MS) {
-    latestSensorData = readSensors();
-    lastSensorReadMs = nowMs;
-
-    if (latestSensorData.dhtValid) {
-      closeDayIfDateChanged();
-      updateDailyTemperatureRange(latestSensorData.temperature);
-    }
-
-    handleAutomaticWatering();
-  }
-
-  if (nowMs - lastTelemetryMs >= TELEMETRY_INTERVAL_MS) {
-    publishTelemetry(latestSensorData.temperature,
-                     latestSensorData.humidity,
-                     latestSensorData.soilPercent,
-                     dayTmax,
-                     dayTmin,
-                     currentDailyGdd,
-                     completedCgdd,
-                     currentStage,
-                     isPumpRunning(),
-                     getCurrentMode(),
-                     latestWateringDecision);
-    lastTelemetryMs = nowMs;
-  }
-
-  if (nowMs - lastSerialPrintMs >= SERIAL_PRINT_INTERVAL_MS) {
-    printStatus();
-    lastSerialPrintMs = nowMs;
-  }
+  vTaskDelay(pdMS_TO_TICKS(1000));
 }
